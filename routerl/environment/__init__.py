@@ -1,6 +1,7 @@
 from .agent import BaseAgent
 from .agent import HumanAgent
 from .agent import MachineAgent
+from .agent import OneActionAgent
 
 from .agent_generation import generate_agents
 from .agent_generation import generate_agent_data

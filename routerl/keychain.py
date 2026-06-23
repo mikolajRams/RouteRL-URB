@@ -37,6 +37,7 @@ class Keychain:
     PREVIOUS_AGENTS_PLUS_START_TIME_DETECTOR_DATA = "previous_agents_plus_start_time_detector_data"
     TRIP_INFO_ETA = "trip_info_eta"
     GROUP_VICINITY = "group_vicinity"
+    MARGINAL_COST_COEFFICIENT_BETA = "marginal_cost_coefficient_beta"
 
     ### Environment
     NUMBER_OF_DAYS = "number_of_days"
@@ -61,6 +62,7 @@ class Keychain:
     PHASE_NAMES = "phase_names"
     SMOOTH_BY = "smooth_by"
     CLEAR_RECORDS = "clear_records"
+    RECORD = "track_records"
 
     ### Agent generation
     NUM_AGENTS = "num_agents"

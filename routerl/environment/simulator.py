@@ -57,6 +57,7 @@ class SumoSimulator():
         self.daily_reseed        = params[kc.DAILY_RESEED]
         self.use_libsumo         = params[kc.USE_LIBSUMO]
         self.use_sumo_teleport   = params[kc.USE_SUMO_TELEPORT]
+        self.records_folder      = params[kc.RECORDS_FOLDER]
 
         self.experiment_id = 0 # for generate_asgn_data, overwritten through env.unwrapped.simulator.experiment_id = ... in URB scripts
         self.generate_asgn_data = generate_asgn_data
@@ -324,11 +325,12 @@ class SumoSimulator():
         paths_list = [path.split(" ") for path in paths_df["path"].values]
         detectors_name = sorted(list(set([node for path in paths_list for node in path])))
         
-        with open(self.det_xml_save_path, "w") as det:
-            print("""<additional>""", file=det)
-            for det_id in detectors_name:
-                print(f"<inductionLoop id=\"{det_id}_det\" lane=\"{det_id}_0\" pos=\"-5\" file=\"NUL\" friendlyPos=\"True\"/>", file=det)
-            print("</additional>", file=det)
+        if self.save_detectors_info:
+            with open(self.det_xml_save_path, "w") as det:
+                print("""<additional>""", file=det)
+                for det_id in detectors_name:
+                    print(f"<inductionLoop id=\"{det_id}_det\" lane=\"{det_id}_0\" pos=\"-5\" file=\"NUL\" friendlyPos=\"True\"/>", file=det)
+                print("</additional>", file=det)
             
         return detectors_name
 
@@ -350,6 +352,8 @@ class SumoSimulator():
         
         combined_sumo_stats_file = os.path.join(self.sumo_save_path,
                                                 f"sumo_stats_{self.runs}.xml")
+        
+        additional_files = f"{self.det_xml_save_path},{self.rou_xml_save_path}" if self.save_detectors_info else f"{self.rou_xml_save_path}"
 
         time_to_teleport = self.stuck_time if self.use_sumo_teleport else -1
         sumo_cmd = [
@@ -359,7 +363,8 @@ class SumoSimulator():
             "--net-file",
             self.network_file_path,
             "--additional-files",
-            f"{self.det_xml_save_path},{self.rou_xml_save_path}",
+            additional_files,
+            #f"{self.det_xml_save_path},{self.rou_xml_save_path}",
             "--no-step-log",
             "true",
             "--time-to-teleport",
@@ -374,12 +379,12 @@ class SumoSimulator():
         # import libsumo while using traci semantics
         if self.use_libsumo:
             import libsumo as traci
-            traci.start(sumo_cmd, label=self.sumo_id)
+            traci.start(self.sumo_cmd(), label=self.sumo_id)
             self.sumo_connection = traci
 
         else:
             import traci
-            traci.start(sumo_cmd, label=self.sumo_id)
+            traci.start(self.sumo_cmd(), label=self.sumo_id)
             self.sumo_connection = traci.getConnection(self.sumo_id)
 
 
@@ -415,6 +420,8 @@ class SumoSimulator():
                                                 f"sumo_stats_{self.runs}.xml")
         
         if self.daily_reseed:   self.day_seed = random.randint(0, 1000)
+
+        additional_files = f"{self.det_xml_save_path},{self.rou_xml_save_path}" if self.save_detectors_info else f"{self.rou_xml_save_path}"
         
         time_to_teleport = self.stuck_time if self.use_sumo_teleport else -1
         sumo_cmd = [
@@ -423,7 +430,8 @@ class SumoSimulator():
             "--net-file",
             self.network_file_path,
             "--additional-files",
-            f"{self.det_xml_save_path},{self.rou_xml_save_path}",
+            additional_files,
+            #f"{self.det_xml_save_path},{self.rou_xml_save_path}",
             "--no-step-log",
             "true",
             "--time-to-teleport",
@@ -434,13 +442,50 @@ class SumoSimulator():
             individual_sumo_stats_file
             ]
         
-        self.sumo_connection.load(sumo_cmd)
+        self.sumo_connection.load(self.sumo_cmd(reset = True))
         
 
         self.timestep = 0
         self.waiting_vehicles = dict()
         return det_dict
 
+    #TODO clean up functions using this (start and reset)
+    #TODO disabling of combined_sumo_stats_file and individual_sumo_stats_file should be done in another fashion entirely (its dirty rn)
+    def sumo_cmd(self, reset = False):
+        if self.daily_reseed:   self.day_seed = random.randint(0, 1000)
+
+        individual_sumo_stats_file = os.path.join(self.sumo_save_path,
+                                                  f"detailed_sumo_stats_{self.runs}.xml")
+        combined_sumo_stats_file = os.path.join(self.sumo_save_path,
+                                                f"sumo_stats_{self.runs}.xml")
+        if self.records_folder == os.devnull:
+            combined_sumo_stats_file    = os.devnull
+            individual_sumo_stats_file  = os.devnull
+
+
+        additional_files = f"{self.det_xml_save_path},{self.rou_xml_save_path}" if self.save_detectors_info else f"{self.rou_xml_save_path}"
+        
+        time_to_teleport = self.stuck_time if self.use_sumo_teleport else -1
+        result =  [] if reset else [self.sumo_type]
+        result += [ 
+            "--seed",
+            str(self.day_seed),
+            "--net-file",
+            self.network_file_path,
+            "--additional-files",
+            additional_files,
+            "--no-step-log",
+            "true",
+            "--time-to-teleport",
+            f"{time_to_teleport}",
+            "--statistic-output",
+            combined_sumo_stats_file,
+            "--tripinfo-output",
+            individual_sumo_stats_file
+            ]
+        return result
+        
+    
     ################################
     ######### SIMULATION ###########
     ################################

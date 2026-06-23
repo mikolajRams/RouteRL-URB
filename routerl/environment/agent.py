@@ -10,6 +10,9 @@ from abc import ABC, abstractmethod
 from routerl.keychain import Keychain as kc
 from routerl.human_learning import Random
 from routerl.human_learning import get_learning_model
+from concurrent.futures import ProcessPoolExecutor
+import copy as cp
+import torch
 
 
 class BaseAgent(ABC):
@@ -244,7 +247,101 @@ class HumanAgent(BaseAgent):
 
         own_tt = -1 * next(obs[kc.TRAVEL_TIME] for obs in observation if obs[kc.AGENT_ID] == self.id)
         return own_tt
-    
+
+
+
+class OneActionAgent(BaseAgent):
+    """Class representing drivers that always pick the same action, made for calculation of marginal cost.
+
+    Args:
+        id (int):
+            The id of the agent.
+        start_time (float):
+            The start time of the agent.
+        origin (float):
+            The origin of the agent.
+        destination (float):
+            The destination value of the agent.
+    """
+
+    def __init__(self, id, start_time, origin, destination, action):
+        kind = kc.TYPE_HUMAN
+        behavior = kc.SELFISH
+        super().__init__(id, kind, start_time, origin, destination, behavior)
+        self.default_action = action
+        self._last_reward = 0
+
+    def __repr__(self):
+        return f"Human {self.id}"
+
+    @property
+    def last_reward(self) -> float:
+        """Set the last reward of the agent.
+
+        Returns:
+            float: The last reward of the agent.
+        """
+
+        return self._last_reward
+
+    @last_reward.setter
+    def last_reward(self, reward) -> None:
+        """Set the last reward of the agent.
+
+        Args:
+            reward (float): The reward of the agent.
+        Returns:
+            None
+        """
+
+        self._last_reward = reward
+
+    def act(self, observation) -> int:  
+        """Returns the agent's action (route of choice) based on the current observation from the environment.
+
+        Args:
+            observation (list): The observation of the agent.
+        Returns:
+            int: The action of the agent.
+        """
+
+        return self.default_action
+
+    def learn(self, action, observation) -> None:
+        """Updates the agent's knowledge based on the action taken and the resulting observations.
+
+        Args:
+            action (int): The action of the agent.
+            observation (list[dict]): The observation of the agent.
+        Returns:
+            None
+        """
+        pass
+
+
+    def get_state(self, _) -> None:
+        """Returns the current state of the agent.
+
+        Args:
+            _ (Any): The current state of the agent.
+        Returns:
+            None
+        """
+
+        return None
+
+    def get_reward(self, observation: list[dict]) -> float:
+        """This function calculated the reward of each individual agent.
+
+        Args:
+            observation (list[dict]): The observation of the agent.
+        Returns:
+            float: Own travel time of the agent.
+        """
+
+        own_tt = -1 * next(obs[kc.TRAVEL_TIME] for obs in observation if obs[kc.AGENT_ID] == self.id)
+        return own_tt
+
 
 class MachineAgent(BaseAgent):
     """A class that models Autonomous Vehicles (AVs), focusing on their learning mechanisms
@@ -275,6 +372,7 @@ class MachineAgent(BaseAgent):
         self.model = None
         self.last_reward = None
         self.rewards_coefs = self._get_reward_coefs()
+        self.params = params
 
     def __repr__(self) -> str:
         machine_id = f"Machine {self.id}"
@@ -368,7 +466,14 @@ class MachineAgent(BaseAgent):
         warmth_agents = warmth_human + warmth_machine
         return warmth_agents
 
-    def get_reward(self, observation: list[dict], group_vicinity: bool = False) -> float:
+    def include_impact_in_reward(self, marginal_cost_matrix) -> float:
+        machine_row = marginal_cost_matrix[self.id]
+        total_impact = sum(machine_row.values())
+
+        return total_impact
+
+
+    def get_reward(self, observation: list[dict], group_vicinity: bool = False, marginal_cost_matrix = None) -> float:
         """This method calculated the reward of each individual agent, based on the travel time of the agent,
         the group of agents, the other agents, and all agents, weighted according to the agent's behavior.
 
@@ -407,6 +512,16 @@ class MachineAgent(BaseAgent):
         
         a, b, c, d = self.rewards_coefs
         agent_reward  = a * own_tt + b * group_tt + c * others_tt + d * all_tt
+
+
+        beta = self.params[kc.MARGINAL_COST_COEFFICIENT_BETA]
+        if beta > 0:
+            total_impact = self.include_impact_in_reward(marginal_cost_matrix)
+
+            tahned_impact = torch.tanh(torch.tensor(total_impact))
+            agent_reward = agent_reward - beta * tahned_impact.numpy() # - beta since the greater the impact the lower the reward
+
+
         return agent_reward
 
     def _get_reward_coefs(self) -> tuple:
@@ -430,3 +545,77 @@ class MachineAgent(BaseAgent):
         elif self.behavior == kc.MILITANT:
             a, b, c, d = 0, -2, 1, 0
         return a, b, c, d
+
+
+
+
+##############################
+##### marginal cost pool #####
+##############################
+
+class MarginalCostPool:
+    def __init__(self,
+                 *args,
+                 **kwargs):
+        """Pool of TrafficEnvironment instances. 
+        """
+        self._env_args = args
+        self._env_kwargs = kwargs
+        return
+
+    def start(self, worker_num: int = 0):
+        if 0 == worker_num:
+            worker_num = os.cpu_count()-1
+        self._worker_num = worker_num
+        self._workers = []
+        task_que = mp.Queue()
+        output_que = mp.Queue()
+
+        for i in range(worker_num):
+            worker = mp.Process(target=self._worker_fn,
+                                args=(task_que, output_que,
+                                self._env_args), 
+                                kwargs=self._env_kwargs, 
+                                daemon=True, 
+                                name=f"worker-{i}")
+            worker.start()
+            self._workers.append(worker)
+
+        return
+
+
+
+
+    @staticmethod
+    def _worker_fn(task_que, output_que, *args, **kwargs):
+        env = ParallelTrafficEnvironment(*args, **kwargs)
+        env.start()
+
+        while True:
+            i, task = task_que.get()
+            result = None
+            try:
+                result = task(env)
+            except Exception:
+                pass
+            output_que.put((i, result))
+
+    def for_all(task: callable, n: int):
+        """
+        Does task(i) for all i in 0..n-1 in a parallel fashion and returns results.
+
+        Args:
+            task ((int, TrafficEnvironment) -> Object): task to be performed on each integer from 0...n-1.
+            n: how many times task should be performed.
+        """
+        for i in range(n):
+            self._task_que.put((i,task))
+
+        results = [None]*n 
+        for _ in range(n):
+            i, result = self._output_que.get()
+            results[i] = result
+
+        return results
+
+

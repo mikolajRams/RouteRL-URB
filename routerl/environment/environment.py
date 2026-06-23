@@ -22,6 +22,7 @@ import random
 from routerl.environment import generate_agents
 from routerl.environment import SumoSimulator
 from routerl.environment import MachineAgent
+from routerl.environment import OneActionAgent
 from routerl.environment.observations import *
 from routerl.keychain import Keychain as kc
 from routerl.services import plotter
@@ -497,9 +498,12 @@ class TrafficEnvironment(AECEnv):
             if self._agent_selector.is_last():
                 # Increase day number
                 self.day += 1
+                
+                # Calculate marginal cost
+                marginal_cost = self.calculate_marginal_cost()
 
                 # Calculate the rewards
-                self._assign_rewards()
+                self._assign_rewards(marginal_cost)
 
                 # The episode ends when we complete episode_length days
                 self.truncations = {agent: not (self.day % self.number_of_days) for agent in self.agents}
@@ -702,7 +706,7 @@ class TrafficEnvironment(AECEnv):
             self._agent_selector = agent_selector(self.possible_agents)
             self.agent_selection = self._agent_selector.next()
 
-        if self.day % self.save_every == 0:
+        if self.day % self.save_every == 0 and self.plotter_params.get(kc.RECORD, True):
             dc_episode, dc_ep_observations, dc_agents, dc_detectors = dc(self.day), dc(self.travel_times_list), dc(self.all_agents), dc(detectors_dict)
             recording_task = self.executor.submit(self._record, dc_episode, dc_ep_observations, dc_agents, dc_detectors)
             self.pending_futures.append(recording_task)
@@ -715,13 +719,17 @@ class TrafficEnvironment(AECEnv):
         self.episode_actions = dict()
         self.episode_observations = dict()
 
-    def _assign_rewards(self) -> None:
+    def _assign_rewards(self, marginal_cost = None) -> None:
 
         for agent in self.all_agents:
             if agent.kind == 'Human':
                 reward = agent.get_reward(self.travel_times_list)
             else:
-                reward = agent.get_reward(self.travel_times_list, group_vicinity=self.agent_params[kc.MACHINE_PARAMETERS][kc.GROUP_VICINITY])
+                reward = agent.get_reward(
+                    self.travel_times_list, 
+                    group_vicinity=self.agent_params[kc.MACHINE_PARAMETERS][kc.GROUP_VICINITY], 
+                    marginal_cost_matrix=marginal_cost
+                )
 
             # Add the reward in the travel_times_list
             for agent_entry in self.travel_times_list:
@@ -792,6 +800,7 @@ class TrafficEnvironment(AECEnv):
                         self.episode_observations[machine.id] = self._serialize_observation(observation)
                         machine.last_action = machine_action
                         self.actions_timestep.append((machine, machine_action))
+                        #self.actions_timestep.append((machine, machine_action if machine_action is not None else machine.default_action)) #TODO inspect
 
                         # The machine acted should be deleted from the self.machine_same_start_time list
                         if machine in self.machine_same_start_time:
@@ -963,6 +972,32 @@ class TrafficEnvironment(AECEnv):
         else:
             raise ValueError('[MODEL INVALID] Unrecognized observation type: ' + observation_type)
 
+    # marginal_cost[agent_i][agent_j] is the cost that agent_i imposed on agent_j
+    def calculate_marginal_cost(self, machines_to_all: bool = True):
+        executor = ProcessPoolExecutor(
+            max_workers=15, 
+            mp_context=None, 
+            initializer=_MarginalCostWorker.initWorker, 
+            initargs=(
+                cp.deepcopy(self.all_agents), 
+                cp.deepcopy(self.travel_times_list), 
+                cp.deepcopy(self.seed), 
+                cp.deepcopy(machines_to_all),
+                cp.deepcopy(self.kwargs)
+            ), 
+            max_tasks_per_child=None)
+
+        #machine_agents = [agent for agent in self.all_agents if agent.kind == kc.TYPE_MACHINE]
+        agent_to_calculate_ids = [agent.id for agent in self.machine_agents]
+        #print(agent_to_calculate_ids)
+        result = executor.map(_MarginalCostWorker.task, agent_to_calculate_ids) 
+
+        return dict(zip(agent_to_calculate_ids, result))
+        #return marginal_cost_calculation
+
+
+
+
     ##########################################
     ### support for MultiSyncDataCollector ###
     ##########################################
@@ -1075,4 +1110,104 @@ class MultiSyncTrafficEnvironment(TrafficEnvironment):
             obj.__class__ = new_cls
             if readonly:
                 self.ro.add(obj)
+
+
+class _MarginalCostWorker:
+    @staticmethod
+    def initWorker(all_agents, travel_times_list, sumo_seed, machines_to_all, kwargs):
+        global _worker_all_agents
+        global _worker_travel_times_list
+        global _worker_sumo_seed
+        global _worker_machines_to_all
+        global _worker_kwargs
+        global _worker_env
+        _worker_all_agents          = all_agents
+        _worker_travel_times_list   = travel_times_list
+        _worker_sumo_seed           = sumo_seed
+        _worker_machines_to_all     = machines_to_all
+        _worker_kwargs              = kwargs
+
+        # mock agents used for environment initialization
+        initial_agents = []
+        for agent in all_agents:
+            initial_agents.append(OneActionAgent(agent.id, agent.start_time, agent.origin, agent.destination, agent.last_action))
+
+        initial_agents.pop() #during marginal calculation one agents is always gone
+
+        # Init environment
+        params = kwargs
+        sim_params  = params[kc.SIMULATOR]
+        sim_params[kc.USE_LIBSUMO] = True
+        plotter_params = params[kc.PLOTTER]
+        plotter_params[kc.CLEAR_RECORDS] = False
+        plotter_params[kc.RECORD] = False
+        _worker_env = TrafficEnvironment(
+            seed=sumo_seed, 
+            create_agents=False, 
+            create_paths=False, 
+            agents=initial_agents, 
+            **params
+        )
+        _worker_env.simulator.records_folder = os.devnull
+        _worker_env.start()
+        
+
+    @staticmethod
+    def filter_agents(env, agent_id):
+        all_agents = _worker_all_agents
+
+        # Filter agents
+        filtered_agents = []
+        for agent in all_agents:
+            if agent.id == agent_id:
+                continue
+
+            filtered_agents.append(OneActionAgent(agent.id, agent.start_time, agent.origin, agent.destination, agent.last_action))
+
+        env.all_agents      = filtered_agents
+        env.human_agents    = filtered_agents
+
+    @staticmethod
+    def task(agent_id):
+        all_agents          = _worker_all_agents
+        travel_times_list   = _worker_travel_times_list
+        sumo_seed           = _worker_sumo_seed
+        machines_to_all     = _worker_machines_to_all
+        kwargs              = _worker_kwargs
+        env                 = _worker_env
+        human_parameters    = kwargs[kc.AGENTS][kc.HUMAN_PARAMETERS]
+
+        _MarginalCostWorker.filter_agents(env, agent_id)
+        env.reset()
+        env.step()
+        
+        agent_marginal_cost = {}
+        for agent in all_agents:
+            if machines_to_all == False: #whether to calculate the impact of deleting a machine agent on the other machine agents
+                                         #or on human agents as well
+                if agent.id == agent_id or agent.kind == kc.TYPE_HUMAN:
+                    if agent.kind != kc.TYPE_HUMAN:
+                        agent_marginal_cost[agent.id] = 0.0 
+                    continue
+
+            after_step_time = _MarginalCostWorker.get_travel_time_by_id(env.last_episode_travel_times, agent.id)
+            initial_time = _MarginalCostWorker.get_travel_time_by_id(travel_times_list, agent.id)
+
+            if initial_time is not None and after_step_time is not None:
+                difference = initial_time - after_step_time  #consistent with the formulation from Anastasias paper
+                #print(f"{difference}")
+                agent_marginal_cost[agent.id] = difference
+            else:
+                agent_marginal_cost[agent.id] = 0.0
+
+        #print(agent_marginal_cost)
+        return agent_marginal_cost
+
+
+    @staticmethod
+    def get_travel_time_by_id(travel_times_list, agent_id):
+        for entry in travel_times_list:
+            if entry['id'] == agent_id:
+                return entry['travel_time']
+        return None
 
