@@ -1138,6 +1138,8 @@ class _MarginalCostWorker:
         params = kwargs
         sim_params  = params[kc.SIMULATOR]
         sim_params[kc.USE_LIBSUMO] = True
+        sim_params[kc.USE_SUMO_TELEPORT] = True
+        sim_params[kc.DISABLE_SUMO_STATS] = True
         plotter_params = params[kc.PLOTTER]
         plotter_params[kc.CLEAR_RECORDS] = False
         plotter_params[kc.RECORD] = False
@@ -1148,10 +1150,10 @@ class _MarginalCostWorker:
             agents=initial_agents, 
             **params
         )
+        _worker_env._record = _MarginalCostWorker.noop
         _worker_env.simulator.records_folder = os.devnull
         _worker_env.start()
-        
-
+    
     @staticmethod
     def filter_agents(env, agent_id):
         all_agents = _worker_all_agents
@@ -1210,4 +1212,9 @@ class _MarginalCostWorker:
             if entry['id'] == agent_id:
                 return entry['travel_time']
         return None
+
+
+    @staticmethod
+    def noop(*args, **kwargs):
+        pass
 

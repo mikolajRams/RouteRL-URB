@@ -52,6 +52,7 @@ class Keychain:
     DAILY_RESEED = "daily_reseed"    
     USE_LIBSUMO = "use_libsumo"
     USE_SUMO_TELEPORT = "use_sumo_teleport"
+    DISABLE_SUMO_STATS = "disable_sumo_stats"
 
 
     ### Plotter

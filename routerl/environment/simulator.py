@@ -58,6 +58,7 @@ class SumoSimulator():
         self.use_libsumo         = params[kc.USE_LIBSUMO]
         self.use_sumo_teleport   = params[kc.USE_SUMO_TELEPORT]
         self.records_folder      = params[kc.RECORDS_FOLDER]
+        self.disable_sumo_stats  = params[kc.DISABLE_SUMO_STATS]
 
         self.experiment_id = 0 # for generate_asgn_data, overwritten through env.unwrapped.simulator.experiment_id = ... in URB scripts
         self.generate_asgn_data = generate_asgn_data
@@ -347,34 +348,6 @@ class SumoSimulator():
         
         self.runs += 1
 
-        individual_sumo_stats_file = os.path.join(self.sumo_save_path,
-                                                  f"detailed_sumo_stats_{self.runs}.xml")
-        
-        combined_sumo_stats_file = os.path.join(self.sumo_save_path,
-                                                f"sumo_stats_{self.runs}.xml")
-        
-        additional_files = f"{self.det_xml_save_path},{self.rou_xml_save_path}" if self.save_detectors_info else f"{self.rou_xml_save_path}"
-
-        time_to_teleport = self.stuck_time if self.use_sumo_teleport else -1
-        sumo_cmd = [
-            self.sumo_type,
-            "--seed",
-            str(self.day_seed),
-            "--net-file",
-            self.network_file_path,
-            "--additional-files",
-            additional_files,
-            #f"{self.det_xml_save_path},{self.rou_xml_save_path}",
-            "--no-step-log",
-            "true",
-            "--time-to-teleport",
-            f"{time_to_teleport}",
-            "--statistic-output",
-            combined_sumo_stats_file,
-            "--tripinfo-output",
-            individual_sumo_stats_file
-            ]
-
         
         # import libsumo while using traci semantics
         if self.use_libsumo:
@@ -466,7 +439,9 @@ class SumoSimulator():
         additional_files = f"{self.det_xml_save_path},{self.rou_xml_save_path}" if self.save_detectors_info else f"{self.rou_xml_save_path}"
         
         time_to_teleport = self.stuck_time if self.use_sumo_teleport else -1
-        result =  [] if reset else [self.sumo_type]
+
+        #pass sumo type if it first simulation
+        result = [] if reset else [self.sumo_type]
         result += [ 
             "--seed",
             str(self.day_seed),
@@ -478,11 +453,16 @@ class SumoSimulator():
             "true",
             "--time-to-teleport",
             f"{time_to_teleport}",
-            "--statistic-output",
-            combined_sumo_stats_file,
-            "--tripinfo-output",
-            individual_sumo_stats_file
             ]
+        #add sumo outputs if theyre enabled
+        if not self.disable_sumo_stats:
+            result += [
+                "--statistic-output",
+                combined_sumo_stats_file,
+                "--tripinfo-output",
+                individual_sumo_stats_file
+            ]
+        
         return result
         
     
