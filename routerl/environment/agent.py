@@ -518,8 +518,9 @@ class MachineAgent(BaseAgent):
         if beta > 0:
             total_impact = self.include_impact_in_reward(marginal_cost_matrix)
 
-            tahned_impact = torch.tanh(torch.tensor(total_impact))
-            agent_reward = agent_reward - beta * tahned_impact.numpy() # - beta since the greater the impact the lower the reward
+            #tahned_impact = torch.tanh(torch.tensor(total_impact))
+            #agent_reward = agent_reward - beta * tahned_impact.numpy() # - beta since the greater the impact the lower the reward
+            agent_reward = agent_reward - beta * total_impact # - beta since the greater the impact the lower the reward
 
 
         return agent_reward
