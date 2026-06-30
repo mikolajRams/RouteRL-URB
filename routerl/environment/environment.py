@@ -501,6 +501,7 @@ class TrafficEnvironment(AECEnv):
                 
                 # Calculate marginal cost
                 marginal_cost = self.calculate_marginal_cost()
+                self.recorder.remember_marginal_costs(marginal_cost, self.day-1) #TODO awful improve
 
                 # Calculate the rewards
                 self._assign_rewards(marginal_cost)

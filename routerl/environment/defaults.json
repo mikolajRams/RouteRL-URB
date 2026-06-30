@@ -75,6 +75,7 @@
     {
         "records_folder": "training_records",
         "plots_folder": "plots",
+        "marginal_matrices_folder": "marginal_cost_matrices",
 
         "plot_choices" : "all",
         "smooth_by" : 50,

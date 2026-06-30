@@ -56,6 +56,7 @@ class Keychain:
 
 
     ### Plotter
+    MARGINAL_MATRIX_FOLDER = "marginal_matrices_folder"
     RECORDS_FOLDER = "records_folder"
     PLOTS_FOLDER = "plots_folder"
     PLOT_CHOICES = "plot_choices"
