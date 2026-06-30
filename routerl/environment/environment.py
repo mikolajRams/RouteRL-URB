@@ -986,7 +986,7 @@ class TrafficEnvironment(AECEnv):
                 cp.deepcopy(machines_to_all),
                 cp.deepcopy(self.kwargs)
             ), 
-            max_tasks_per_child=None)
+        )
 
         #machine_agents = [agent for agent in self.all_agents if agent.kind == kc.TYPE_MACHINE]
         agent_to_calculate_ids = [agent.id for agent in self.machine_agents]
