@@ -472,6 +472,20 @@ class MachineAgent(BaseAgent):
 
         return total_impact
 
+    def include_approximated_impact_in_reward(
+        self,
+        marginal_cost_matrix,
+    ) -> float:
+        if marginal_cost_matrix is None:
+            return 0.0
+
+        return float(
+            marginal_cost_matrix.get(
+                int(self.id),
+                0.0,
+            )
+        )
+
 
     def get_reward(self, observation: list[dict], group_vicinity: bool = False, marginal_cost_matrix = None) -> float:
         """This method calculated the reward of each individual agent, based on the travel time of the agent,
@@ -516,11 +530,12 @@ class MachineAgent(BaseAgent):
 
         beta = self.params[kc.MARGINAL_COST_COEFFICIENT_BETA]
         if beta > 0:
-            total_impact = self.include_impact_in_reward(marginal_cost_matrix)
+            #total_impact = self.include_impact_in_reward(marginal_cost_matrix)
+            total_impact = self.include_approximated_impact_in_reward(marginal_cost_matrix)
 
-            #tahned_impact = torch.tanh(torch.tensor(total_impact))
-            #agent_reward = agent_reward - beta * tahned_impact.numpy() # - beta since the greater the impact the lower the reward
-            agent_reward = agent_reward - beta * total_impact # - beta since the greater the impact the lower the reward
+            tahned_impact = torch.tanh(torch.tensor(total_impact))
+            agent_reward = agent_reward - beta * tahned_impact.numpy() # - beta since the greater the impact the lower the reward
+            #agent_reward = agent_reward - beta * total_impact # - beta since the greater the impact the lower the reward
 
 
         return agent_reward

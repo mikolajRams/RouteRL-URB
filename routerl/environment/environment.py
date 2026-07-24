@@ -18,6 +18,7 @@ import logging
 import numpy as np
 import pandas as pd
 import random
+import sys
 
 from routerl.environment import generate_agents
 from routerl.environment import SumoSimulator
@@ -500,11 +501,14 @@ class TrafficEnvironment(AECEnv):
                 self.day += 1
                 
                 # Calculate marginal cost
-                marginal_cost = self.calculate_marginal_cost()
-                self.recorder.remember_marginal_costs(marginal_cost, self.day-1) #TODO awful improve
+                #marginal_cost = self.calculate_marginal_cost()
+                #self.recorder.remember_marginal_costs(marginal_cost, self.day-1) #TODO awful improve
+
+                # Calculate approximated marginal cost
+                approximated_marginal_cost = self.calculate_approximated_marginal_cost()
 
                 # Calculate the rewards
-                self._assign_rewards(marginal_cost)
+                self._assign_rewards(approximated_marginal_cost)
 
                 # The episode ends when we complete episode_length days
                 self.truncations = {agent: not (self.day % self.number_of_days) for agent in self.agents}
@@ -976,7 +980,7 @@ class TrafficEnvironment(AECEnv):
     # marginal_cost[agent_i][agent_j] is the cost that agent_i imposed on agent_j
     def calculate_marginal_cost(self, machines_to_all: bool = True):
         executor = ProcessPoolExecutor(
-            max_workers=15, 
+            max_workers=2, 
             mp_context=None, 
             initializer=_MarginalCostWorker.initWorker, 
             initargs=(
@@ -996,7 +1000,1057 @@ class TrafficEnvironment(AECEnv):
         return dict(zip(agent_to_calculate_ids, result))
         #return marginal_cost_calculation
 
+    def get_previous_actions(
+        self,
+        agents,
+        av_agent_id,
+    ):
+        av_agent = next(
+            (
+                agent
+                for agent in agents
+                if agent["id"] == av_agent_id
+            ),
+            None,
+        )
 
+        if av_agent is None:
+            raise ValueError(
+                f"Agent {av_agent_id} was not found."
+            )
+
+        if av_agent.get("kind") != "AV":
+            raise ValueError(
+                f"Agent {av_agent_id} is not an AV agent."
+            )
+
+        relevant_agents = sorted(
+            [
+                agent
+                for agent in agents
+                if (
+                    agent["start_time"]
+                    < av_agent["start_time"]
+                )
+            ]
+            + [av_agent],
+            key=lambda agent: (
+                agent["start_time"],
+                agent["id"],
+            ),
+        )
+
+        return {
+            "agent_id": av_agent["id"],
+            "start_time": av_agent["start_time"],
+            "agent_ids": [
+                agent["id"]
+                for agent in relevant_agents
+            ],
+            "actions": [
+                agent["action"]
+                for agent in relevant_agents
+            ],
+            "travel_times": [
+                agent["travel_time"]
+                for agent in relevant_agents
+            ],
+        }
+    
+    def assign_joint_action_to_cluster(
+        self,
+        result,
+        cluster_csv=(
+            "agent_actions_with_cluster.csv"
+        ),
+        theta=2,
+        acceptance_quantile=0.95,
+    ):
+        """
+        Assign a partial joint action to the nearest cluster using
+        the same distance objective as the clustering.
+
+        result must contain:
+            result["agent_ids"]
+            result["travel_times"]
+
+        Returns
+        -------
+        dict containing:
+            best_cluster
+            belongs_to_cluster
+            distance
+            acceptance_threshold
+            ranking
+        """
+
+        df = pd.read_csv(cluster_csv)
+
+        required_columns = {
+            "simulation_id",
+            "agent_id",
+            "cluster",
+            "travel_time",
+        }
+
+        missing = required_columns - set(df.columns)
+
+        if missing:
+            raise ValueError(
+                f"Missing CSV columns: {sorted(missing)}"
+            )
+
+        if len(result["agent_ids"]) != len(
+            result["travel_times"]
+        ):
+            raise ValueError(
+                "agent_ids and travel_times must have "
+                "the same length."
+            )
+
+        observed = pd.DataFrame(
+            {
+                "agent_id": result["agent_ids"],
+                "observed_time": result["travel_times"],
+            }
+        )
+
+
+        # Agent-specific centroid for every cluster.
+        centroids = (
+            df.groupby(
+                ["cluster", "agent_id"],
+                as_index=False,
+            )["travel_time"]
+            .mean()
+            .rename(
+                columns={
+                    "travel_time": "centroid_time"
+                }
+            )
+        )
+
+        # Add centroid values to every training observation.
+        training = df.merge(
+            centroids,
+            on=["cluster", "agent_id"],
+            how="left",
+            validate="many_to_one",
+        )
+
+        rows = []
+
+        for cluster_id, cluster_centroid in (
+            centroids.groupby("cluster")
+        ):
+            matched = observed.merge(
+                cluster_centroid[
+                    ["agent_id", "centroid_time"]
+                ],
+                on="agent_id",
+                how="inner",
+            )
+
+            coverage = (
+                len(matched) / len(observed)
+            )
+
+            if matched.empty:
+                continue
+
+            difference = (
+                matched["observed_time"]
+                - matched["centroid_time"]
+            )
+
+            individual_powered_differences = (
+                np.abs(difference) ** theta
+            )
+
+            # Sum over individual agents, matching the sum over i
+            # in the mathematical objective.
+            objective = individual_powered_differences.sum()
+
+            distance = objective ** (1 / theta)
+
+            # Use exactly the agents that were matched for this cluster.
+            matched_agent_ids = matched["agent_id"].unique()
+
+            cluster_training = training[
+                (training["cluster"] == cluster_id)
+                & (
+                    training["agent_id"].isin(
+                        matched_agent_ids
+                    )
+                )
+            ].copy()
+
+            cluster_training["powered_error"] = (
+                np.abs(
+                    cluster_training["travel_time"]
+                    - cluster_training["centroid_time"]
+                )
+                ** theta
+            )
+
+            # Calculate one summed objective and one agent count
+            # for each historical simulation.
+            training_summary = (
+                cluster_training
+                .groupby("simulation_id")
+                .agg(
+                    training_objective=(
+                        "powered_error",
+                        "sum",
+                    ),
+                    number_of_agents=(
+                        "agent_id",
+                        "nunique",
+                    ),
+                )
+            )
+
+            # Keep only historical simulations that contain all
+            # agents used in the current cluster comparison.
+            training_summary = training_summary[
+                training_summary["number_of_agents"]
+                == len(matched_agent_ids)
+            ]
+
+            training_distances = (
+                training_summary["training_objective"]
+                ** (1 / theta)
+            ).dropna()
+
+            if training_distances.empty:
+                continue
+
+            threshold = training_distances.quantile(
+                acceptance_quantile
+            )
+
+            # Empirical cluster compatibility.
+            #
+            # This is the proportion of historical cluster members
+            # that were at least as far from the centroid as the
+            # current joint action.
+            compatibility = (
+                1
+                + (training_distances >= distance).sum()
+            ) / (
+                len(training_distances) + 1
+            )
+
+            rows.append(
+                {
+                    "cluster": cluster_id,
+                    "objective": float(objective),
+                    "distance": float(distance),
+                    "threshold": float(threshold),
+                    "compatibility": float(
+                        compatibility
+                    ),
+                    "matched_agents": len(matched),
+                    "total_agents": len(observed),
+                    "coverage": float(coverage),
+                    "training_simulations": len(
+                        training_distances
+                    ),
+                }
+            )
+
+        ranking = pd.DataFrame(rows)
+
+        if ranking.empty:
+            raise ValueError(
+                "No agents from the result were found "
+                "in the cluster CSV."
+            )
+
+        ranking = ranking.sort_values(
+            [
+                "objective",
+                "cluster",
+            ]
+        ).reset_index(drop=True)
+
+        ranking["rank"] = (
+            np.arange(len(ranking)) + 1
+        )
+
+        # ----------------------------------------------------
+        # Identify whose partial joint-action information
+        # is being evaluated.
+        # ----------------------------------------------------
+        query_agent_id = result.get("agent_id")
+
+        # For acceptance_quantile = 0.95, alpha = 0.05.
+        alpha = 1 - acceptance_quantile
+
+        ranking["query_agent_id"] = query_agent_id
+
+        # Decide compatibility using the empirical
+        # compatibility score.
+        ranking["compatible"] = (
+            ranking["compatibility"] > alpha
+        )
+
+        # Keep the distance-threshold decision as a
+        # separate diagnostic.
+        ranking["within_threshold"] = (
+            ranking["distance"]
+            <= ranking["threshold"]
+        )
+
+        best = ranking.iloc[0]
+
+        compatible_clusters = (
+            ranking.loc[
+                ranking["compatible"],
+                "cluster",
+            ]
+            .tolist()
+        )
+
+        return {
+            "query_agent_id": query_agent_id,
+            "number_of_known_agents": len(
+                result["agent_ids"]
+            ),
+            "best_cluster": best["cluster"],
+            "belongs_to_cluster": bool(
+                best["compatible"]
+            ),
+            "best_cluster_compatibility": float(
+                best["compatibility"]
+            ),
+            "compatible_clusters": compatible_clusters,
+            "distance": float(
+                best["distance"]
+            ),
+            "acceptance_threshold": float(
+                best["threshold"]
+            ),
+            "coverage": float(
+                best["coverage"]
+            ),
+            "ranking": ranking,
+        }
+
+     # marginal_cost[agent_i][agent_j] is the cost that agent_i imposed on agent_j
+    def calculate_marginal_cost_for_agent_id(self, agent_to_calculate_ids, travel_times_list, machines_to_all: bool = True):
+            executor = ProcessPoolExecutor(
+                max_workers=1, 
+                mp_context=None, 
+                initializer=_MarginalCostWorker.initWorker, 
+                initargs=(
+                    cp.deepcopy(self.all_agents), 
+                    cp.deepcopy(travel_times_list), 
+                    cp.deepcopy(self.seed), 
+                    cp.deepcopy(machines_to_all),
+                    cp.deepcopy(self.kwargs)
+                ), 
+            )
+    
+            #machine_agents = [agent for agent in self.all_agents if agent.kind == kc.TYPE_MACHINE]
+            #agent_to_calculate_ids = [agent.id for agent in self.machine_agents]
+            #print(agent_to_calculate_ids)
+            result = executor.map(_MarginalCostWorker.task, agent_to_calculate_ids) 
+    
+            return dict(zip(agent_to_calculate_ids, result))
+            #return marginal_cost_calculation
+
+    def _compute_cluster_total_marginal_cost(
+        self,
+        machine_id,
+        cluster_id,
+        known_agent_ids,
+        cluster_data,
+        current_records_by_agent,
+        theta,
+    ):
+        """
+        Compute the marginal cost of one AV in one cluster.
+
+        This is the expensive part. It should only be called when
+        the (machine_id, cluster_id) combination is not cached.
+
+        Returns
+        -------
+        dict | None
+            Cache entry containing the per-agent differences and
+            their summed external marginal cost.
+        """
+
+        machine_id = int(machine_id)
+        cluster_id = int(cluster_id)
+
+        selected_cluster_data = cluster_data.loc[
+            (
+                cluster_data["cluster"] == cluster_id
+            )
+            & (
+                cluster_data["agent_id"].isin(
+                    known_agent_ids
+                )
+            )
+        ].copy()
+
+        if selected_cluster_data.empty:
+            print(
+                f"Cluster {cluster_id} has no records for "
+                f"machine {machine_id}'s known agents."
+            )
+            return None
+
+        # ========================================================
+        # Compute the agent-specific travel-time centroid
+        # ========================================================
+        cluster_centroid = (
+            selected_cluster_data
+            .groupby(
+                "agent_id",
+                as_index=False,
+            )["travel_time"]
+            .mean()
+            .rename(
+                columns={
+                    "travel_time": "centroid_time"
+                }
+            )
+        )
+
+        if cluster_centroid.empty:
+            return None
+
+        centroid_candidates = (
+            selected_cluster_data.merge(
+                cluster_centroid,
+                on="agent_id",
+                how="inner",
+                validate="many_to_one",
+            )
+        )
+
+        centroid_candidates["powered_error"] = (
+            np.abs(
+                centroid_candidates["travel_time"]
+                - centroid_candidates[
+                    "centroid_time"
+                ]
+            )
+            ** theta
+        )
+
+        number_of_centroid_agents = int(
+            cluster_centroid[
+                "agent_id"
+            ].nunique()
+        )
+
+        # ========================================================
+        # Find the historical simulation closest to the centroid
+        # ========================================================
+        simulation_errors = (
+            centroid_candidates
+            .groupby(
+                "simulation_id",
+                as_index=False,
+            )
+            .agg(
+                centroid_objective=(
+                    "powered_error",
+                    "sum",
+                ),
+                number_of_agents=(
+                    "agent_id",
+                    "nunique",
+                ),
+            )
+        )
+
+        simulation_errors = (
+            simulation_errors.loc[
+                simulation_errors[
+                    "number_of_agents"
+                ]
+                == number_of_centroid_agents
+            ]
+            .copy()
+        )
+
+        if simulation_errors.empty:
+            print(
+                f"No complete representative simulation for "
+                f"machine {machine_id}, cluster {cluster_id}."
+            )
+            return None
+
+        simulation_errors[
+            "centroid_distance"
+        ] = (
+            simulation_errors[
+                "centroid_objective"
+            ]
+            ** (1 / theta)
+        )
+
+        simulation_errors = (
+            simulation_errors
+            .sort_values(
+                [
+                    "centroid_objective",
+                    "simulation_id",
+                ],
+                ascending=[True, True],
+            )
+            .reset_index(drop=True)
+        )
+
+        representative_simulation = (
+            simulation_errors.iloc[0]
+        )
+
+        centroid_simulation_id = (
+            representative_simulation[
+                "simulation_id"
+            ]
+        )
+
+        centroid_objective = float(
+            representative_simulation[
+                "centroid_objective"
+            ]
+        )
+
+        centroid_error = float(
+            representative_simulation[
+                "centroid_distance"
+            ]
+        )
+
+        # Retrieve valid discrete actions from the representative
+        # historical simulation.
+        centroid_rows = (
+            selected_cluster_data.loc[
+                selected_cluster_data[
+                    "simulation_id"
+                ]
+                == centroid_simulation_id
+            ]
+            .sort_values("agent_id")
+            .drop_duplicates(
+                subset=["agent_id"],
+                keep="first",
+            )
+        )
+
+        if centroid_rows.empty:
+            return None
+
+        centroid_time_by_agent = {
+            int(agent_id): float(centroid_time)
+            for agent_id, centroid_time in zip(
+                cluster_centroid["agent_id"],
+                cluster_centroid[
+                    "centroid_time"
+                ],
+            )
+        }
+
+        centroid_action_by_agent = {
+            int(agent_id): int(action)
+            for agent_id, action in zip(
+                centroid_rows["agent_id"],
+                centroid_rows["action"],
+            )
+        }
+
+        # ========================================================
+        # Construct the with-AV cluster baseline
+        # ========================================================
+        cluster_centroid_travel_times_list = []
+        returned_agent_ids = []
+
+        for agent_id in known_agent_ids:
+            agent_id = int(agent_id)
+
+            if agent_id not in centroid_time_by_agent:
+                continue
+
+            if agent_id not in centroid_action_by_agent:
+                continue
+
+            current_record = (
+                current_records_by_agent.get(
+                    agent_id
+                )
+            )
+
+            if current_record is None:
+                continue
+
+            centroid_record = dc(
+                current_record
+            )
+
+            centroid_record["action"] = int(
+                centroid_action_by_agent[
+                    agent_id
+                ]
+            )
+
+            centroid_record["travel_time"] = float(
+                centroid_time_by_agent[
+                    agent_id
+                ]
+            )
+
+            centroid_record.pop(
+                "reward",
+                None,
+            )
+
+            cluster_centroid_travel_times_list.append(
+                centroid_record
+            )
+
+            returned_agent_ids.append(
+                agent_id
+            )
+
+        if not cluster_centroid_travel_times_list:
+            return None
+
+        # The AV must be present in the with-AV baseline.
+        if machine_id not in returned_agent_ids:
+            print(
+                f"Machine {machine_id} is missing from the "
+                f"centroid baseline for cluster {cluster_id}."
+            )
+            return None
+
+        # ========================================================
+        # Remove the AV and rerun SUMO
+        # ========================================================
+        try:
+            marginal_cost_result = (
+                self.calculate_marginal_cost_for_agent_id(
+                    [machine_id],
+                    cluster_centroid_travel_times_list,
+                )
+            )
+        except Exception as exc:
+            print(
+                f"Marginal-cost calculation failed for "
+                f"machine {machine_id}, cluster {cluster_id}: "
+                f"{exc}"
+            )
+            return None
+
+        machine_marginal_cost = marginal_cost_result.get(
+            machine_id,
+            {},
+        )
+
+        if machine_marginal_cost is None:
+            machine_marginal_cost = {}
+
+        # Sum the travel-time differences immediately.
+        # Do not save the individual affected-agent values.
+        total_external_marginal_cost = float(
+            sum(
+                float(cost)
+                for affected_agent_id, cost
+                in machine_marginal_cost.items()
+                if int(affected_agent_id) != machine_id
+            )
+        )
+
+        return total_external_marginal_cost
+
+
+    def calculate_approximated_marginal_cost(
+        self,
+        cluster_csv="agent_actions_with_cluster.csv",
+        theta=2,
+        acceptance_quantile=0.95,
+        precompute_all_clusters=False,
+        force_recompute=False,
+    ):
+        """
+        Compute compatibility-weighted marginal costs using a cache.
+
+        Cache structure
+        ---------------
+        {
+            machine_id: {
+                cluster_id: total_external_marginal_cost
+            }
+        }
+
+        For every machine i and cluster c:
+
+            MC[i, c] = sum over j != i of:
+                T_with_i[j, c] - T_without_i[j, c]
+
+        For the current episode:
+
+            estimated_MC[i] =
+                sum over compatible clusters c of:
+                normalized_weight[i, c] * MC[i, c]
+
+        Returns
+        -------
+        dict
+            {
+                machine_id: aggregated_marginal_cost
+            }
+        """
+
+        if theta <= 0:
+            raise ValueError(
+                f"theta must be positive, received {theta}."
+            )
+
+        if not 0 < acceptance_quantile < 1:
+            raise ValueError(
+                "acceptance_quantile must be between 0 and 1."
+            )
+
+        cluster_data = pd.read_csv(cluster_csv)
+
+        required_columns = {
+            "simulation_id",
+            "agent_id",
+            "cluster",
+            "travel_time",
+            "action",
+        }
+
+        missing_columns = (
+            required_columns - set(cluster_data.columns)
+        )
+
+        if missing_columns:
+            raise ValueError(
+                "The cluster CSV is missing required columns: "
+                f"{sorted(missing_columns)}"
+            )
+
+        if cluster_data.empty:
+            raise ValueError(
+                f"The cluster CSV '{cluster_csv}' is empty."
+            )
+
+        cluster_data["agent_id"] = pd.to_numeric(
+            cluster_data["agent_id"],
+            errors="raise",
+        ).astype(int)
+
+        cluster_data["cluster"] = pd.to_numeric(
+            cluster_data["cluster"],
+            errors="raise",
+        ).astype(int)
+
+        cluster_data["travel_time"] = pd.to_numeric(
+            cluster_data["travel_time"],
+            errors="raise",
+        ).astype(float)
+
+        cluster_data["action"] = pd.to_numeric(
+            cluster_data["action"],
+            errors="raise",
+        ).astype(int)
+
+        if not hasattr(
+            self,
+            "approximated_marginal_cost_cache",
+        ):
+            self.approximated_marginal_cost_cache = {}
+
+        approximated_marginal_cost_matrix = {}
+        results_by_machine = {}
+
+        for machine in self.machine_agents:
+            machine_id = int(machine.id)
+
+            # ----------------------------------------------------
+            # Current partial outcome for this AV
+            # ----------------------------------------------------
+            av_result = self.get_previous_actions(
+                agents=self.travel_times_list,
+                av_agent_id=machine_id,
+            )
+
+            known_agent_ids = [
+                int(agent_id)
+                for agent_id in av_result["agent_ids"]
+            ]
+
+            current_records_by_agent = {
+                int(record["id"]): record
+                for record in self.travel_times_list
+            }
+
+            # ----------------------------------------------------
+            # Compute current cluster compatibilities
+            # ----------------------------------------------------
+            assignment = self.assign_joint_action_to_cluster(
+                result=av_result,
+                cluster_csv=cluster_csv,
+                theta=theta,
+                acceptance_quantile=acceptance_quantile,
+            )
+
+            ranking = assignment["ranking"].copy()
+
+            ranking["cluster"] = (
+                ranking["cluster"].astype(int)
+            )
+
+            compatible_ranking = (
+                ranking.loc[
+                    ranking["compatible"].astype(bool)
+                ]
+                .sort_values(
+                    ["objective", "cluster"],
+                    ascending=[True, True],
+                )
+                .reset_index(drop=True)
+            )
+
+            compatible_clusters = [
+                int(cluster_id)
+                for cluster_id in (
+                    compatible_ranking["cluster"].tolist()
+                )
+            ]
+
+            machine_cache = (
+                self.approximated_marginal_cost_cache
+                .setdefault(
+                    machine_id,
+                    {},
+                )
+            )
+
+            # Precompute every ranked cluster or only those that
+            # are compatible in the current episode.
+            if precompute_all_clusters:
+                clusters_to_prepare = (
+                    ranking
+                    .sort_values(
+                        ["objective", "cluster"]
+                    )
+                    .drop_duplicates(
+                        subset=["cluster"]
+                    )
+                    .reset_index(drop=True)
+                )
+            else:
+                clusters_to_prepare = (
+                    compatible_ranking
+                )
+
+            cache_hit_by_cluster = {}
+
+            # ====================================================
+            # Compute only missing cache values
+            # ====================================================
+            for _, cluster_row in (
+                clusters_to_prepare.iterrows()
+            ):
+                cluster_id = int(
+                    cluster_row["cluster"]
+                )
+
+                is_cached = (
+                    cluster_id in machine_cache
+                )
+
+                if is_cached and not force_recompute:
+                    cache_hit_by_cluster[
+                        cluster_id
+                    ] = True
+                    continue
+
+                cache_hit_by_cluster[
+                    cluster_id
+                ] = False
+
+                cluster_total_marginal_cost = (
+                    self
+                    ._compute_cluster_total_marginal_cost(
+                        machine_id=machine_id,
+                        cluster_id=cluster_id,
+                        known_agent_ids=known_agent_ids,
+                        cluster_data=cluster_data,
+                        current_records_by_agent=(
+                            current_records_by_agent
+                        ),
+                        theta=theta,
+                    )
+                )
+
+                if cluster_total_marginal_cost is None:
+                    continue
+
+                # Save only the scalar total.
+                machine_cache[cluster_id] = float(
+                    cluster_total_marginal_cost
+                )
+
+                """print(
+                    f"Cached marginal cost for machine "
+                    f"{machine_id}, cluster {cluster_id}: "
+                    f"{machine_cache[cluster_id]}"
+                )"""
+
+            # ====================================================
+            # Retrieve cached totals for compatible clusters
+            # ====================================================
+            raw_compatibilities = {}
+            total_marginal_cost_by_cluster = {}
+
+            for _, compatible_row in (
+                compatible_ranking.iterrows()
+            ):
+                cluster_id = int(
+                    compatible_row["cluster"]
+                )
+
+                if cluster_id not in machine_cache:
+                    continue
+
+                compatibility = float(
+                    compatible_row["compatibility"]
+                )
+
+                if (
+                    not np.isfinite(compatibility)
+                    or compatibility < 0
+                ):
+                    compatibility = 0.0
+
+                raw_compatibilities[
+                    cluster_id
+                ] = compatibility
+
+                total_marginal_cost_by_cluster[
+                    cluster_id
+                ] = float(
+                    machine_cache[cluster_id]
+                )
+
+            valid_clusters = list(
+                total_marginal_cost_by_cluster.keys()
+            )
+
+            normalized_weights = {}
+            weighted_contribution_by_cluster = {}
+            aggregated_total_marginal_cost = 0.0
+
+            # ====================================================
+            # Normalize compatibility weights
+            # ====================================================
+            if valid_clusters:
+                total_compatibility = float(
+                    sum(
+                        raw_compatibilities[
+                            cluster_id
+                        ]
+                        for cluster_id in valid_clusters
+                    )
+                )
+
+                if total_compatibility > 0:
+                    normalized_weights = {
+                        cluster_id: float(
+                            raw_compatibilities[
+                                cluster_id
+                            ]
+                            / total_compatibility
+                        )
+                        for cluster_id in valid_clusters
+                    }
+                else:
+                    equal_weight = (
+                        1.0 / len(valid_clusters)
+                    )
+
+                    normalized_weights = {
+                        cluster_id: float(
+                            equal_weight
+                        )
+                        for cluster_id in valid_clusters
+                    }
+
+                # =================================================
+                # Weight the cached cluster totals
+                # =================================================
+                weighted_contribution_by_cluster = {
+                    cluster_id: float(
+                        normalized_weights[
+                            cluster_id
+                        ]
+                        * total_marginal_cost_by_cluster[
+                            cluster_id
+                        ]
+                    )
+                    for cluster_id in valid_clusters
+                }
+
+                aggregated_total_marginal_cost = float(
+                    sum(
+                        weighted_contribution_by_cluster.values()
+                    )
+                )
+
+            approximated_marginal_cost_matrix[
+                machine_id
+            ] = aggregated_total_marginal_cost
+
+            # Current-episode diagnostics contain only scalar
+            # cluster totals—no per-agent marginal costs.
+            results_by_machine[machine_id] = {
+                "compatible_clusters": (
+                    compatible_clusters
+                ),
+                "used_clusters": (
+                    valid_clusters
+                ),
+                "cached_clusters": sorted(
+                    machine_cache.keys()
+                ),
+                "cache_hit_by_cluster": (
+                    cache_hit_by_cluster
+                ),
+                "raw_cluster_compatibilities": (
+                    raw_compatibilities
+                ),
+                "cluster_weights": (
+                    normalized_weights
+                ),
+                "total_marginal_cost_by_cluster": (
+                    total_marginal_cost_by_cluster
+                ),
+                "weighted_contribution_by_cluster": (
+                    weighted_contribution_by_cluster
+                ),
+                "aggregated_total_marginal_cost": (
+                    aggregated_total_marginal_cost
+                ),
+            }
+
+
+        self.approximated_marginal_cost_details = (
+            results_by_machine
+        )
+
+        #print("approximated marginal cost details", self.approximated_marginal_cost_details, "\n\n")
+
+        return approximated_marginal_cost_matrix
 
 
     ##########################################
@@ -1138,7 +2192,13 @@ class _MarginalCostWorker:
         # Init environment
         params = kwargs
         sim_params  = params[kc.SIMULATOR]
-        sim_params[kc.USE_LIBSUMO] = True
+        #sim_params[kc.USE_LIBSUMO] = True
+        # Libsumo is failing to load locally on Windows.
+        # Use the standard TraCI client instead.
+        if sys.platform == "win32":
+            sim_params[kc.USE_LIBSUMO] = False
+        else:
+            sim_params[kc.USE_LIBSUMO] = True
         sim_params[kc.USE_SUMO_TELEPORT] = True
         sim_params[kc.DISABLE_SUMO_STATS] = True
         plotter_params = params[kc.PLOTTER]
