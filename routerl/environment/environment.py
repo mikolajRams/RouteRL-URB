@@ -1060,9 +1060,7 @@ class TrafficEnvironment(AECEnv):
     def assign_joint_action_to_cluster(
         self,
         result,
-        cluster_csv=(
-            "agent_actions_with_cluster.csv"
-        ),
+        cluster_data,
         theta=2,
         acceptance_quantile=0.95,
     ):
@@ -1084,7 +1082,7 @@ class TrafficEnvironment(AECEnv):
             ranking
         """
 
-        df = pd.read_csv(cluster_csv)
+        df = cluster_data
 
         required_columns = {
             "simulation_id",
@@ -1718,7 +1716,24 @@ class TrafficEnvironment(AECEnv):
                 "acceptance_quantile must be between 0 and 1."
             )
 
-        cluster_data = pd.read_csv(cluster_csv)
+        cluster_data = pd.read_csv(
+            cluster_csv,
+            usecols=[
+                "simulation_id",
+                "agent_id",
+                "cluster",
+                "travel_time",
+                "action",
+            ],
+            dtype={
+                "simulation_id": np.int32,
+                "agent_id": np.int16,
+                "cluster": np.int16,
+                "travel_time": np.float32,
+                "action": np.uint8,
+            },
+            low_memory=False,
+        )
 
         required_columns = {
             "simulation_id",
@@ -1742,26 +1757,6 @@ class TrafficEnvironment(AECEnv):
             raise ValueError(
                 f"The cluster CSV '{cluster_csv}' is empty."
             )
-
-        cluster_data["agent_id"] = pd.to_numeric(
-            cluster_data["agent_id"],
-            errors="raise",
-        ).astype(int)
-
-        cluster_data["cluster"] = pd.to_numeric(
-            cluster_data["cluster"],
-            errors="raise",
-        ).astype(int)
-
-        cluster_data["travel_time"] = pd.to_numeric(
-            cluster_data["travel_time"],
-            errors="raise",
-        ).astype(float)
-
-        cluster_data["action"] = pd.to_numeric(
-            cluster_data["action"],
-            errors="raise",
-        ).astype(int)
 
         if not hasattr(
             self,
@@ -1798,7 +1793,7 @@ class TrafficEnvironment(AECEnv):
             # ----------------------------------------------------
             assignment = self.assign_joint_action_to_cluster(
                 result=av_result,
-                cluster_csv=cluster_csv,
+                cluster_data=cluster_data,
                 theta=theta,
                 acceptance_quantile=acceptance_quantile,
             )
