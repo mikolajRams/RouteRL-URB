@@ -7,12 +7,67 @@ import numpy as np
 from abc import ABC, abstractmethod
 import os
 import pandas as pd
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
 from concurrent.futures import ProcessPoolExecutor
 import copy as cp
+import traci.constants as tc
 
 from routerl.keychain import Keychain as kc
 from .simulator import SumoSimulator
+
+def pad_invalid_freeflows_for_observation(
+    freeflows: Dict[tuple, list[float]],
+    action_masks: Optional[Dict[tuple, np.ndarray]]
+) -> Dict[tuple, np.ndarray]:
+    """
+    Replace masked free-flow slots with a neutral value for observations.
+    The invalid slots stay masked externally, so this only affects what the
+    network sees. Using a per-OD max keeps the scale consistent and avoids zero-padding
+    or giant placeholder values.
+    """
+
+    padded: Dict[tuple, np.ndarray] = {}
+    for od, ff_values in freeflows.items():
+        ff = np.asarray(ff_values, dtype=np.float32).copy()
+        if action_masks is None:
+            padded[od] = ff
+            continue
+
+        if od not in action_masks:
+            raise ValueError(f"Missing action mask for OD {od}")
+
+        mask = np.asarray(action_masks[od], dtype=bool).reshape(-1)
+        if ff.shape[0] != mask.shape[0]:
+            raise ValueError(
+                f"Free-flow length {ff.shape[0]} does not match mask length {mask.shape[0]} for OD {od}"
+            )
+        if not mask.any():
+            raise ValueError(f"OD {od} has no valid routes in its action mask")
+
+        valid_ff = ff[mask]
+        pad_value = float(valid_ff.max())
+        
+        ff[~mask] = pad_value
+        padded[od] = ff
+
+    return padded
+
+
+def get_ema(ff_time, values, max_length=10):
+    """
+    Compute the exponential moving average (EMA) given the list of
+    observed travel times.
+    """
+    ema_val = ff_time
+
+    values = values[-max_length:] if len(values) > max_length else values
+    k = len(values)
+    alpha = 2 / (k + 1)
+
+    for tt in values:
+        ema_val = (alpha * tt) + ((1 - alpha) * ema_val)
+
+    return ema_val
 
 
 class Observations(ABC):
@@ -457,6 +512,16 @@ class TripInfoWithETA(Observations):
         self.NUM_PATHS = simulation_params[kc.NUMBER_OF_PATHS]
         self.OBS_SIZE = 3 + self.NUM_PATHS  # Start time + origin + destination + TT EMAs
         self.freeflows = freeflows
+        #self.observations = self.reset_observation()
+        self.origin_scale = max(
+        max(int(agent.origin) for agent in machine_agents_list + human_agents_list),
+        1
+        )
+
+        self.destination_scale = max(
+        max(int(agent.destination) for agent in machine_agents_list + human_agents_list),
+        1
+        )
         self.observations = self.reset_observation()
 
     def __call__(self, all_agents: List[Any]) -> Dict[str, Any]:
@@ -475,11 +540,13 @@ class TripInfoWithETA(Observations):
         Returns:
             obs (Dict[str, np.ndarray]): A dictionary of initial observations for all machine agents.
         """
+
+        
         obs = {
             str(agent.id): np.concatenate(
                 [
                     np.array(self.freeflows[(agent.origin, agent.destination)], dtype=np.float32),  # Free flow time
-                    np.array([int(agent.origin), int(agent.destination), int(agent.start_time)], dtype=np.float32)
+                    np.array([float(agent.origin)/self.origin_scale, float(agent.destination)/ self.destination_scale, float(agent.start_time)/1798], dtype=np.float32)
                 ]
             )
             for agent in self.machine_agents_list
@@ -505,14 +572,7 @@ class TripInfoWithETA(Observations):
             for agent in self.machine_agents_list
         }
     
-    def agent_observations(self, agent_id: str, all_agents: List[Any], agent_selection: str, travel_times: List[Any]) -> np.ndarray:
-        """Retrieve the observation for a specific agent.
-
-        Args:
-            agent_id (str): The ID of the agent.
-        Returns:
-            np.ndarray: The observation array for the specified agent.
-        """
+    """def agent_observations(self, agent_id: str, all_agents: List[Any], agent_selection: str, travel_times: List[Any]) -> np.ndarray:
         machine = next((m for m in self.machine_agents_list if m.id == int(agent_id)), None)
         assert machine is not None, f"Observing machine with ID {agent_id} not found."
             
@@ -543,8 +603,102 @@ class TripInfoWithETA(Observations):
         # Every other entry in the obs is already set at reset   
         observation = np.array(observation, dtype=np.float32) # Ensure dtype
         self.observations[str(machine.id)] = observation.copy()
+        return observation"""
+    def agent_observations(
+        self,
+        agent_id: str,
+        all_agents: List[Any],
+        agent_selection: str,
+        travel_times: List[Any]
+    ) -> np.ndarray:
+
+        machine = next(
+        (m for m in self.machine_agents_list if m.id == int(agent_id)),
+        None
+        )
+
+        assert machine is not None, (
+        f"Observing machine with ID {agent_id} not found."
+        )
+
+        observation = self.observations[str(machine.id)].copy()
+
+        agent_dicts = []
+
+        for entry in travel_times:
+            not_agent_itself = entry[kc.AGENT_ID] != machine.id
+            same_origin = entry[kc.AGENT_ORIGIN] == machine.origin
+            same_destination = (
+            entry[kc.AGENT_DESTINATION] == machine.destination
+            )
+            earlier_departure = (
+            entry[kc.AGENT_START_TIME] <= machine.start_time
+            )
+
+            if all((
+                not_agent_itself,
+                same_origin,
+                same_destination,
+                earlier_departure
+            )):
+                agent_dicts.append(entry.copy())
+
+        agent_dicts.sort(
+        key=lambda x:
+        x[kc.AGENT_START_TIME]
+        + (x[kc.TRAVEL_TIME] * 60.0)
+        )
+
+        tt_lists = {
+        idx: []
+        for idx in range(self.NUM_PATHS)
+        }
+
+        for entry in agent_dicts:
+            path_idx = int(entry[kc.ACTION])
+            travel_time = entry[kc.TRAVEL_TIME]
+
+            tt_lists[path_idx].append(travel_time)
+
+        # Update ETA entries
+        for i in range(self.NUM_PATHS):
+            ff_time = self.freeflows[
+                (machine.origin, machine.destination)
+            ][i]
+
+            previous_tts = tt_lists[i][:]
+
+            observation[i] = get_ema(
+            ff_time,
+            previous_tts
+            ) / 10.0
+
+        # --------------------------------------------------
+        # NORMALIZE ORIGIN AND DESTINATION
+        # --------------------------------------------------
+
+        observation[self.NUM_PATHS] = (
+        float(machine.origin)
+        / self.origin_scale
+        )
+
+        observation[self.NUM_PATHS + 1] = (
+        float(machine.destination)
+        / self.destination_scale
+        )
+
+        observation = np.array(
+        observation,
+        dtype=np.float32
+        )
+
+        observation[self.NUM_PATHS + 2] = float(machine.start_time) / 1798.0
+
+        self.observations[str(machine.id)] = (
+        observation.copy()
+        )
+
         return observation
-    
     
     def get_ema(self, ff_time, values, max_length=10):
         """
@@ -571,6 +725,5 @@ class TripInfoWithETA(Observations):
             ema_val = (alpha * tt) + ((1 - alpha) * ema_val)
             
         return ema_val
-
 
 
